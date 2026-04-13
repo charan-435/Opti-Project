@@ -1,274 +1,168 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import seaborn as sns
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, f1_score, matthews_corrcoef, cohen_kappa_score
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import os
+import csv
 
-base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-results_dir = os.path.join(base_dir, "data/results")
-os.makedirs(results_dir, exist_ok=True)
+# path stuff
+path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+out_dir = os.path.join(path, "data/results")
+if not os.path.exists(out_dir): os.makedirs(out_dir)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------------------------------------------------------
-# Constants (must match classifier.py)
-# ---------------------------------------------------------
-SEQ_LEN     = 2
-HIDDEN_SIZE = 128
+# params
+steps = 2
+h = 128
 
-# ---------------------------------------------------------
-# LSTM Model (same as classifier.py)
-# ---------------------------------------------------------
-class LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size=HIDDEN_SIZE, num_layers=2, num_classes=2, dropout=0.5):
-        super(LSTMClassifier, self).__init__()
-        self.lstm = nn.LSTM(input_size=input_size,
-                            hidden_size=hidden_size,
-                            num_layers=num_layers,
-                            batch_first=True,
-                            dropout=dropout)
-        self.fc = nn.Linear(hidden_size, num_classes)
+class MyLSTM(nn.Module):
+    def __init__(self, in_size):
+        super(MyLSTM, self).__init__()
+        self.lstm = nn.LSTM(in_size, h, num_layers=2, batch_first=True, dropout=0.5)
+        self.fc = nn.Linear(h, 2)
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        return self.fc(out)
+        o, _ = self.lstm(x)
+        return self.fc(o[:, -1, :])
 
 
-# ---------------------------------------------------------
-# Load data and model
-# ---------------------------------------------------------
-X = np.load(os.path.join(base_dir, "data/features/features.npy"))
-y = np.load(os.path.join(base_dir, "data/features/labels.npy"))
+# load data
+x_data = np.load(os.path.join(path, "data/features/features.npy"))
+y_data = np.load(os.path.join(path, "data/features/labels.npy"))
 
-scaler = StandardScaler()
-X = scaler.fit_transform(X)
+sc = StandardScaler()
+x_data = sc.fit_transform(x_data)
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.30, random_state=42, stratify=y)
+x_tr, x_te, y_tr, y_te = train_test_split(x_data, y_data, test_size=0.3, random_state=42, stratify=y_data)
 
-X_tr, X_val, y_tr, y_val = train_test_split(
-    X_train, y_train, test_size=0.15, random_state=42, stratify=y_train)
-
-# LSTM reshaping: split features into SEQ_LEN timesteps
-n_features = X_train.shape[1]
-input_size = n_features // SEQ_LEN
-
-def to_tensor(X, y):
-    Xt = torch.tensor(X[:, :SEQ_LEN * input_size], dtype=torch.float32)
-    Xt = Xt.reshape(-1, SEQ_LEN, input_size).to(device)
+# prep tensors
+dim = x_tr.shape[1] // steps
+def to_t(X, y):
+    xt = torch.tensor(X[:, :steps*dim], dtype=torch.float32).reshape(-1, steps, dim).to(device)
     yt = torch.tensor(y, dtype=torch.long).to(device)
-    return Xt, yt
+    return xt, yt
 
-X_tr_t,  y_tr_t  = to_tensor(X_tr,  y_tr)
-X_test_t, y_test_t = to_tensor(X_test, y_test)
+xtr, ytr = to_t(x_tr, y_tr)
+xte, yte = to_t(x_te, y_te)
 
-# Best hyperparameters — update these after re-running classifier.py
-best_lr = 0.00601250713516592
-best_batch = 34
-best_epochs = 390
+# best params from previous run
+lr = 0.00601250713516592
+bs = 34
+eps = 390
 
-# ---------------------------------------------------------
-# Retrain and record loss/accuracy per epoch
-# ---------------------------------------------------------
-print("Retraining to record curves...")
+print("Training to get curves...")
+model = MyLSTM(dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+crit = nn.CrossEntropyLoss()
 
-model     = LSTMClassifier(input_size=input_size).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
-criterion = nn.CrossEntropyLoss()
+loader = DataLoader(TensorDataset(xtr, ytr), batch_size=bs, shuffle=True)
 
-dataset = TensorDataset(X_tr_t, y_tr_t)
-loader  = DataLoader(dataset, batch_size=best_batch, shuffle=True)
+t_loss, t_acc = [], []
+v_loss, v_acc = [], []
 
-train_losses = []
-train_accs   = []
-val_losses   = []
-val_accs     = []
-
-for epoch in range(1, best_epochs + 1):
-    # --- Train ---
+for e in range(1, eps + 1):
     model.train()
-    total_loss = 0
-    correct    = 0
-    total      = 0
-
+    L, ok, tot = 0, 0, 0
     for xb, yb in loader:
         optimizer.zero_grad()
-        out  = model(xb)
-        loss = criterion(out, yb)
+        out = model(xb)
+        loss = crit(out, yb)
         loss.backward()
         optimizer.step()
+        L += loss.item()
+        ok += (torch.argmax(out, 1) == yb).sum().item()
+        tot += yb.size(0)
+    
+    t_loss.append(L / len(loader))
+    t_acc.append(ok / tot)
 
-        total_loss += loss.item()
-        correct    += (torch.argmax(out, dim=1) == yb).sum().item()
-        total      += yb.size(0)
-
-    train_losses.append(total_loss / len(loader))
-    train_accs.append(correct / total)
-
-    # --- Validation ---
     model.eval()
     with torch.no_grad():
-        val_out  = model(X_test_t)
-        val_loss = criterion(val_out, y_test_t).item()
-        val_pred = torch.argmax(val_out, dim=1).cpu().numpy()
-        val_acc  = (val_pred == y_test).mean()
+        out_v = model(xte)
+        v_l = crit(out_v, yte).item()
+        preds = torch.argmax(out_v, 1).cpu().numpy()
+        v_a = (preds == y_te).mean()
+    
+    v_loss.append(v_l)
+    v_acc.append(v_a)
 
-    val_losses.append(val_loss)
-    val_accs.append(val_acc)
-
-    if epoch % 10 == 0:
-        print(f"  Epoch {epoch:03d}/{best_epochs} | "
-              f"Train Loss: {train_losses[-1]:.4f} | "
-              f"Val Loss: {val_loss:.4f} | "
-              f"Val Acc: {val_acc*100:.2f}%")
+    if e % 20 == 0:
+        print(f"E {e} | loss {t_loss[-1]:.4f} | acc {v_a:.4f}")
 
 
-# ---------------------------------------------------------
-# 1. Accuracy Curve
-# ---------------------------------------------------------
-plt.figure(figsize=(8, 5))
-plt.plot(train_accs, label="Training Accuracy",   color="blue")
-plt.plot(val_accs,   label="Validation Accuracy", color="orange")
-plt.xlabel("Epochs")
-plt.ylabel("Accuracy Per Epoch")
-plt.title("Accuracy Graph")
+# 1. Acc Graph
+plt.figure()
+plt.plot(t_acc, label="train")
+plt.plot(v_acc, label="test")
+plt.title("Accuracy Plot")
 plt.legend()
-plt.tight_layout()
-plt.savefig("data/results/accuracy_curve.png", dpi=150)
+plt.savefig(os.path.join(out_dir, "accuracy_curve.png"))
 plt.close()
-print("Saved: accuracy_curve.png")
 
-
-# ---------------------------------------------------------
-# 2. Loss Curve
-# ---------------------------------------------------------
-plt.figure(figsize=(8, 5))
-plt.plot(train_losses, label="Training Loss",   color="blue")
-plt.plot(val_losses,   label="Validation Loss", color="orange")
-plt.xlabel("Epochs")
-plt.ylabel("Loss Per Epoch")
-plt.title("Loss Graph")
+# 2. Loss Graph
+plt.figure()
+plt.plot(t_loss, label="train")
+plt.plot(v_loss, label="test")
+plt.title("Loss Plot")
 plt.legend()
-plt.tight_layout()
-plt.savefig("data/results/loss_curve.png", dpi=150)
+plt.savefig(os.path.join(out_dir, "loss_curve.png"))
 plt.close()
-print("Saved: loss_curve.png")
 
-
-# ---------------------------------------------------------
-# 3. Confusion Matrix + Compute actual metrics
-# ---------------------------------------------------------
-cm = confusion_matrix(y_test, val_pred)
-
-plt.figure(figsize=(6, 5))
-sns.heatmap(cm, annot=True, fmt="d", cmap="Greens",
-            xticklabels=["Normal", "Abnormal"],
-            yticklabels=["Normal", "Abnormal"])
-plt.xlabel("Predicted")
-plt.ylabel("Actual")
-plt.title("Confusion Matrix")
-plt.tight_layout()
-plt.savefig(os.path.join(results_dir, "confusion_matrix.png"), dpi=150)
+# 3. CM
+cm = confusion_matrix(y_te, preds)
+plt.figure()
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.title("Confusion Matrix Results")
+plt.savefig(os.path.join(out_dir, "confusion_matrix.png"))
 plt.close()
-print("Saved: confusion_matrix.png")
 
-# Compute our actual metrics from the model
-import csv
-from sklearn.metrics import f1_score, matthews_corrcoef, cohen_kappa_score
-
+# get metrics
 tn, fp, fn, tp = cm.ravel()
-sensitivity_val = tp / (tp + fn + 1e-8)
-specificity_val = tn / (tn + fp + 1e-8)
-f1    = f1_score(y_test, val_pred, average="weighted")
-mcc   = matthews_corrcoef(y_test, val_pred)
-kappa = cohen_kappa_score(y_test, val_pred)
-acc   = (val_pred == y_test).mean()
+s1 = tp / (tp + fn + 1e-8)
+s2 = tn / (tn + fp + 1e-8)
+f1 = f1_score(y_te, preds, average="weighted")
+mcc = matthews_corrcoef(y_te, preds)
+kap = cohen_kappa_score(y_te, preds)
+acc = (preds == y_te).mean()
 
+# plots for comparison
+names = ["Mine", "SVM-KP", "SVM-RBF", "Tree", "CART", "RF", "kNN", "LSVM"]
+sens_vals = [round(s1*100, 2), 94.73, 95.62, 97.88, 88.0, 96.0, 80.0, 96.0]
+spec_vals = [round(s2*100, 2), 97.59, 83.71, 91.71, 80.0, 80.0, 80.0, 80.0]
 
-# ---------------------------------------------------------
-# 4. Sensitivity & Specificity Comparison Bar Chart
-# MOAOA-FDL = our actual results; others from paper Table 2
-# ---------------------------------------------------------
-methods     = ["MOAOA-FDL", "SVM-KP", "SVM-RBF", "Decision Tree",
-               "CART", "Random Forest", "k-NN", "Linear SVM"]
-sensitivity = [round(sensitivity_val * 100, 2),
-                            94.73,    95.62,     97.88,
-               88.00,       96.00,    80.00,     96.00]
-specificity = [round(specificity_val * 100, 2),
-                            97.59,    83.71,     91.71,
-               80.00,       80.00,    80.00,     80.00]
-
-x     = np.arange(len(methods))
-width = 0.35
-
-fig, ax = plt.subplots(figsize=(12, 6))
-bars1 = ax.bar(x - width/2, sensitivity, width, label="Sensitivity", color="steelblue")
-bars2 = ax.bar(x + width/2, specificity, width, label="Specificity", color="orange")
-
-ax.set_ylabel("Values (%)")
-ax.set_title("Sensitivity and Specificity Comparison")
-ax.set_xticks(x)
-ax.set_xticklabels(methods, rotation=20, ha="right")
-ax.set_ylim(70, 105)
-ax.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(results_dir, "sensitivity_specificity.png"), dpi=150)
+x = np.arange(len(names))
+w = 0.3
+plt.figure(figsize=(10,6))
+plt.bar(x - w/2, sens_vals, w, label="Sens")
+plt.bar(x + w/2, spec_vals, w, label="Spec")
+plt.xticks(x, names, rotation=45)
+plt.legend()
+plt.title("Comparison Chart")
+plt.savefig(os.path.join(out_dir, "sensitivity_specificity.png"))
 plt.close()
-print("Saved: sensitivity_specificity.png")
 
-
-# ---------------------------------------------------------
-# 5. Accuracy Comparison Bar Chart
-# MOAOA-FDL = our actual accuracy; others from paper Table 2
-# ---------------------------------------------------------
-acc_values = [round(acc * 100, 2),
-              96.18, 89.88, 94.95, 84.00, 88.00, 80.00, 88.00]
-
-fig, ax = plt.subplots(figsize=(10, 6))
-colors = ["steelblue"] + ["orange"] * (len(methods) - 1)
-ax.bar(methods, acc_values, color=colors)
-ax.set_ylabel("Accuracy (%)")
-ax.set_title("Accuracy Comparison")
-ax.set_ylim(70, 105)
-ax.set_xticklabels(methods, rotation=20, ha="right")
-
-for i, v in enumerate(acc_values):
-    ax.text(i, v + 0.5, f"{v}%", ha="center", fontsize=9)
-
-plt.tight_layout()
-plt.savefig(os.path.join(results_dir, "accuracy_comparison.png"), dpi=150)
+accs = [round(acc*100, 2), 96.18, 89.88, 94.95, 84.0, 88.0, 80.0, 88.0]
+plt.figure(figsize=(10,6))
+plt.bar(names, accs, color=["blue"] + ["gray"]*7)
+plt.title("Final Accuracy Comparison")
+plt.savefig(os.path.join(out_dir, "accuracy_comparison.png"))
 plt.close()
-print("Saved: accuracy_comparison.png")
 
+# csv save
+with open(os.path.join(out_dir, "metrics.csv"), "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["Metric", "Val"])
+    w.writerow(["Acc", f"{acc*100:.2f}%"])
+    w.writerow(["Sens", f"{s1*100:.2f}%"])
+    w.writerow(["Spec", f"{s2*100:.2f}%"])
+    w.writerow(["F1", f"{f1*100:.2f}%"])
+    w.writerow(["MCC", f"{mcc:.4f}"])
+    w.writerow(["Kappa", f"{kap:.4f}"])
 
-# ---------------------------------------------------------
-# 6. Save metrics to CSV
-# ---------------------------------------------------------
-metrics = {
-    "Accuracy"   : f"{acc*100:.2f}%",
-    "Sensitivity": f"{sensitivity_val*100:.2f}%",
-    "Specificity": f"{specificity_val*100:.2f}%",
-    "F-Score"    : f"{f1*100:.2f}%",
-    "MCC"        : f"{mcc:.4f}",
-    "Kappa"      : f"{kappa:.4f}",
-}
-
-with open(os.path.join(results_dir, "metrics.csv"), "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["Metric", "Value"])
-    for k, v in metrics.items():
-        writer.writerow([k, v])
-
-print("Saved: metrics.csv")
-print("\nFinal Metrics:")
-for k, v in metrics.items():
-    print(f"  {k:12}: {v}")
-
-print("\nAll results saved to data/results/ - Done!")
+print("All done. Files saved to:", out_dir)
