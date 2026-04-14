@@ -3,111 +3,80 @@ import numpy as np
 import os
 
 
-def flip_horizontal(img):
-    """Flip image left-right."""
+def f_h(img):
+    # flip left-right
     return cv2.flip(img, 1)
 
 
-def flip_vertical(img):
-    """Flip image top-bottom."""
+def f_v(img):
+    # flip top-bottom
     return cv2.flip(img, 0)
 
 
-def rotate_90(img):
-    """Rotate image 90 degrees clockwise."""
+def r90(img):
+    # rotate 90
     return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
 
 
-def rotate_180(img):
-    """Rotate image 180 degrees."""
+def r180(img):
+    # rotate 180
     return cv2.rotate(img, cv2.ROTATE_180)
 
 
-# Maps suffix label -> transform function
-AUGMENTATIONS = {
-    "flip_h":  flip_horizontal,
-    "flip_v":  flip_vertical,
-    "rot90":   rotate_90,
-    "rot180":  rotate_180,
+# suffix -> function
+AUG_MAP = {
+    "flip_h":  f_h,
+    "flip_v":  f_v,
+    "rot90":   r90,
+    "rot180":  r180,
 }
 
 
-def augment_image(img):
-    """
-    Apply all four augmentations to a single image.
-
-    Parameters
-    ----------
-    img : np.ndarray
-        Preprocessed image (H x W, uint8 or float32).
-
-    Returns
-    -------
-    dict[str, np.ndarray]
-        Mapping of augmentation name -> augmented image.
-        Does NOT include the original; caller decides whether to keep it.
-    """
-    return {name: fn(img) for name, fn in AUGMENTATIONS.items()}
+def do_aug_single(img):
+    # apply all 4 to one image
+    return {n: fn(img) for n, fn in AUG_MAP.items()}
 
 
-def augment_dataset(input_dir, output_dir, labels=("yes", "no")):
-    """
-    Walk input_dir/<label>/ for every label, apply all four augmentations
-    to each image, and write results to output_dir/<label>/.
+def run_aug(in_d, out_d, labels=("yes", "no")):
+    # loop through dataset and make augmented versions
+    for l in labels:
+        p1 = os.path.join(in_d, l)
+        p2 = os.path.join(out_d, l)
+        os.makedirs(p2, exist_ok=True)
 
-    Original images are copied across unchanged so the output folder is
-    self-contained.
-
-    Parameters
-    ----------
-    input_dir  : str   Root of the processed dataset, e.g. "data/processed"
-    output_dir : str   Destination root,              e.g. "data/augmented"
-    labels     : tuple Sub-folder names to process.
-    """
-    for label in labels:
-        in_path  = os.path.join(input_dir,  label)
-        out_path = os.path.join(output_dir, label)
-        os.makedirs(out_path, exist_ok=True)
-
-        files = [f for f in os.listdir(in_path)
+        files = [f for f in os.listdir(p1)
                  if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))]
 
         if not files:
-            print(f"[augment] No images found in {in_path}, skipping.")
+            print(f"Nothing found in {p1}")
             continue
 
-        for fname in files:
-            img_path = os.path.join(in_path, fname)
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        for f in files:
+            p = os.path.join(p1, f)
+            img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
 
             if img is None:
-                print(f"[augment] Could not read {img_path}, skipping.")
+                print(f"Error reading {p}")
                 continue
 
-            stem, ext = os.path.splitext(fname)
+            stem, ext = os.path.splitext(f)
 
-            # --- original ------------------------------------------------
-            cv2.imwrite(os.path.join(out_path, fname), img)
+            # save original
+            cv2.imwrite(os.path.join(p2, f), img)
 
-            # --- augmented variants --------------------------------------
-            for aug_name, aug_img in augment_image(img).items():
-                out_name = f"{stem}_{aug_name}{ext}"
-                cv2.imwrite(os.path.join(out_path, out_name), aug_img)
+            # save variants
+            for n, a_img in do_aug_single(img).items():
+                out_name = f"{stem}_{n}{ext}"
+                cv2.imwrite(os.path.join(p2, out_name), a_img)
 
-        total = len(files) * (1 + len(AUGMENTATIONS))
-        print(f"[augment] {label}: {len(files)} originals -> {total} total images")
+        total = len(files) * (1 + len(AUG_MAP))
+        print(f"Done {l}: {len(files)} -> {total} images")
 
 
-# ---------------------------------------------------------------------------
-# CLI entry-point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    import os
+    # add parent to path
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-    INPUT_DIR  = "data/processed"
-    OUTPUT_DIR = "data/augmented"
-
-    augment_dataset(INPUT_DIR, OUTPUT_DIR, labels=("yes", "no"))
-    print("Augmentation complete.")
+    run_aug("data/processed", "data/augmented", labels=("yes", "no"))
+    print("finished augmentation.")

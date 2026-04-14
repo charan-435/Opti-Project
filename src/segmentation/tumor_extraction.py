@@ -2,85 +2,56 @@ import cv2
 import numpy as np
 import os
 
-# ---------------------------------------------------------
-# Tumor extraction from segmented image
-# ---------------------------------------------------------
-def extract_tumor(segmented):
-    levels = np.unique(segmented)
-    print("Unique levels:", levels)  # should now show exactly 4 values
+# extract only the brightest part (tumor)
+def get_tumor(img):
+    vals = np.unique(img)
+    if len(vals) < 3: return np.zeros_like(img)
 
-    if len(levels) < 3:
-        return np.zeros_like(segmented)
+    # brightest region
+    best = vals[-1]
+    m = (img == best).astype(np.uint8) * 255
 
-    # Highest intensity = brightest region = likely tumor in MRI
-    target = levels[-1]
-    mask = (segmented == target).astype(np.uint8) * 255
+    k = np.ones((3, 3), np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
 
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return np.zeros_like(m)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    big = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(big) < 100:
+        return np.zeros_like(m)
 
-    if not contours:
-        return np.zeros_like(mask)
-
-    largest = max(contours, key=cv2.contourArea)
-    print(f"  Largest contour area: {cv2.contourArea(largest)}")
-
-    if cv2.contourArea(largest) < 100:
-        return np.zeros_like(mask)
-
-    clean = np.zeros_like(mask)
-    cv2.drawContours(clean, [largest], -1, 255, -1)
-    return clean
-
-# ---------------------------------------------------------
-# Batch processing
-# ---------------------------------------------------------
-def extract_dataset(input_dir, output_dir, labels=("yes", "no")):
-    """
-    input_dir  = segmented images folder
-    output_dir = tumor-only images folder
-    """
-
-    for label in labels:
-        in_path = os.path.join(input_dir, label)
-        out_path = os.path.join(output_dir, label)
-
-        os.makedirs(out_path, exist_ok=True)
-
-        files = [f for f in os.listdir(in_path)
-                 if f.lower().endswith((".jpg", ".png", ".jpeg"))]
-
-        print(f"[TUMOR] Processing {label} ({len(files)} images)")
-
-        for i, fname in enumerate(files, 1):
-            img_path = os.path.join(in_path, fname)
-            segmented = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-
-            if segmented is None:
-                print(f"Skipping {fname}")
-                continue
-            print("Unique levels:", np.unique(segmented))
-
-            tumor = extract_tumor(segmented)
-
-            cv2.imwrite(os.path.join(out_path, fname), tumor)
-
-            print(f"[{i}/{len(files)}] {fname}")
+    res = np.zeros_like(m)
+    cv2.drawContours(res, [big], -1, 255, -1)
+    return res
 
 
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
+def run_batch_tumor(in_d, out_d, labels=("yes", "no")):
+    for l in labels:
+        p1 = os.path.join(in_d, l)
+        p2 = os.path.join(out_d, l)
+        if not os.path.exists(p2): os.makedirs(p2)
+
+        files = [f for f in os.listdir(p1) if f.lower().endswith((".jpg", ".png", ".jpeg"))]
+        print(f"Batch tumor extraction for {l}")
+
+        for i, f in enumerate(files, 1):
+            p = os.path.join(p1, f)
+            seg = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+            if seg is None: continue
+
+            tumor = get_tumor(seg)
+            cv2.imwrite(os.path.join(p2, f), tumor)
+            
+            if i % 20 == 0:
+                print(f"[{i}/{len(files)}] - tumor done")
+
+
 if __name__ == "__main__":
-    test = cv2.imread("data/segmented_multi/yes/some_image.jpg", cv2.IMREAD_GRAYSCALE)
-    print("Unique pixel values:", np.unique(test))
-    extract_dataset(
-        input_dir="data/segmented_multi",
-        output_dir="data/tumor_only",
-        labels=("yes", "no")
+    run_batch_tumor(
+        in_d = "data/segmented_multi",
+        out_d = "data/tumor_only",
+        labels = ("yes", "no")
     )
-    # Remove the stray print(np.unique(segmented)) line — it's undefined here
-    print("Tumor extraction complete ✅")
+    print("Tumor extraction finished.")

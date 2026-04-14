@@ -1,4 +1,5 @@
 import numpy as np
+import os
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (accuracy_score, confusion_matrix,
@@ -8,236 +9,268 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+# --- settings ---
+n_steps = 2
+h_size = 128
 
-# ---------------------------------------------------------
-# LSTM Model
-# ---------------------------------------------------------
-class LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, num_classes=2, dropout=0.5):
-        super(LSTMClassifier, self).__init__()
-        self.lstm = nn.LSTM(input_size=input_size,
-                            hidden_size=hidden_size,
-                            num_layers=num_layers,
-                            batch_first=True,
+
+class MyLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size=h_size, num_layers=2, num_classes=2, dropout=0.5):
+        super(MyLSTM, self).__init__()
+        self.lstm = nn.LSTM(input_size=input_size, 
+                            hidden_size=hidden_size, 
+                            num_layers=num_layers, 
+                            batch_first=True, 
                             dropout=dropout)
         self.fc = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x):
-        # x: (batch, seq_len, input_size)
+        # x: (batch, n_steps, input_size)
         out, _ = self.lstm(x)
-        out = out[:, -1, :]   # take last timestep
+        out = out[:, -1, :] 
         return self.fc(out)
 
 
-# ---------------------------------------------------------
-# AOA Hyperparameter Optimization
-# ---------------------------------------------------------
-class AOA_LSTM:
-    def __init__(self, n_particles=10, max_iter=20):
-        self.n = n_particles
-        self.T = max_iter
+# Multi-Objective AOA
+class MOAOA_Optimizer:
+    def __init__(self, pop_size=15, iters=30):
+        self.n = pop_size
+        self.T = iters
+        
+        # [lr, batch_size, epochs]
+        self.lower_b = np.array([1e-5, 8, 50])
+        self.upper_b = np.array([1e-2, 64, 1200])
 
-        # Search space: [learning_rate, batch_size, hidden_size]
-        self.lb = np.array([1e-5, 8,  64])
-        self.ub = np.array([1e-2, 64, 256])
+        self.archive = []
+        self.archive_limit = 50
 
-    def _decode(self, pos):
-        lr          = float(np.clip(pos[0], self.lb[0], self.ub[0]))
-        batch_size  = int(np.clip(round(pos[1]), self.lb[1], self.ub[1]))
-        hidden_size = int(np.clip(round(pos[2]), self.lb[2], self.ub[2]))
-        return lr, batch_size, hidden_size
+    def get_params(self, pos):
+        lr = float(np.clip(pos[0], self.lower_b[0], self.upper_b[0]))
+        bs = int(np.clip(round(pos[1]), self.lower_b[1], self.upper_b[1]))
+        eps = int(np.clip(round(pos[2]), self.lower_b[2], self.upper_b[2]))
+        return lr, bs, eps
 
-    def _fitness(self, pos, X_train, y_train, X_val, y_val, input_size):
-        lr, batch_size, hidden_size = self._decode(pos)
+    def fitness_func(self, pos, X_train, y_train, X_val, y_val, input_size):
+        lr, bs, eps = self.get_params(pos)
 
-        model = LSTMClassifier(input_size=input_size,
-                               hidden_size=hidden_size).to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
+        model = MyLSTM(input_size=input_size).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+        crit = nn.CrossEntropyLoss()
 
-        # Quick training - 5 epochs for fitness evaluation
-        dataset = TensorDataset(X_train, y_train)
-        loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        # small training for eval
+        eval_eps = max(5, eps // 20)
+        ds = TensorDataset(X_train, y_train)
+        loader = DataLoader(ds, batch_size=bs, shuffle=True)
 
+        loss_list = []
         model.train()
-        for _ in range(5):
+        for _ in range(eval_eps):
+            L = 0
             for xb, yb in loader:
-                optimizer.zero_grad()
-                loss = criterion(model(xb), yb)
+                opt.zero_grad()
+                out = model(xb)
+                loss = crit(out, yb)
                 loss.backward()
-                optimizer.step()
+                opt.step()
+                L += loss.item()
+            loss_list.append(L / len(loader))
 
-        # Validation accuracy
+        # 1. Error
         model.eval()
         with torch.no_grad():
-            preds = torch.argmax(model(X_val), dim=1).cpu().numpy()
+            p = torch.argmax(model(X_val), dim=1).cpu().numpy()
+        err = 1.0 - accuracy_score(y_val.cpu().numpy(), p)
 
-        acc = accuracy_score(y_val.cpu().numpy(), preds)
-        return acc
+        # 2. Cost
+        cost = (eps - self.lower_b[2]) / (self.upper_b[2] - self.lower_b[2])
 
-    def optimise(self, X_train, y_train, X_val, y_val, input_size):
-        rng = np.random.default_rng(42)
+        # 3. Stability
+        if len(loss_list) > 1:
+            stb = np.std(loss_list) / (np.mean(loss_list) + 1e-8)
+        else:
+            stb = 1.0
 
-        pos = rng.uniform(self.lb, self.ub, (self.n, 3))
-        den = rng.random((self.n, 3))
-        vol = rng.random((self.n, 3))
-        acc = rng.uniform(self.lb, self.ub, (self.n, 3))
+        return np.array([err, cost, stb])
 
-        fitness = np.array([self._fitness(pos[i], X_train, y_train,
-                                          X_val, y_val, input_size)
-                            for i in range(self.n)])
+    def check_dominance(self, a, b):
+        return bool(np.all(a <= b) and np.any(a < b))
 
-        best_idx = np.argmax(fitness)
-        x_best   = pos[best_idx].copy()
-        print(f"  AOA Init | best acc: {fitness[best_idx]:.4f} | "
-              f"params: {self._decode(x_best)}")
+    def get_non_dominated(self, objs):
+        n = len(objs)
+        dominated = np.zeros(n, dtype=bool)
+        for i in range(n):
+            if dominated[i]: continue
+            for j in range(n):
+                if i != j and not dominated[j] and self.check_dominance(objs[j], objs[i]):
+                    dominated[i] = True
+                    break
+        return np.where(~dominated)[0]
 
+    def calc_crowding(self, objs):
+        n = len(objs)
+        if n <= 2: return np.full(n, np.inf)
+        dists = np.zeros(n)
+        for m in range(objs.shape[1]):
+            idx = np.argsort(objs[:, m])
+            dists[idx[0]] = np.inf
+            dists[idx[-1]] = np.inf
+            span = objs[idx[-1], m] - objs[idx[0], m]
+            if span < 1e-10: continue
+            for k in range(1, n - 1):
+                dists[idx[k]] += (objs[idx[idx[k+1]], m] - objs[idx[idx[k-1]], m]) / span
+        return dists
+
+    def update_archive(self, pos_list, obj_list):
+        all_p = list(pos_list)
+        all_o = list(obj_list)
+        for p, o in self.archive:
+            all_p.append(p)
+            all_o.append(o)
+        
+        all_p = np.array(all_p)
+        all_o = np.array(all_o)
+
+        nd = self.get_non_dominated(all_o)
+        if len(nd) > self.archive_limit:
+            # fix this part later maybe
+            dists = np.zeros(len(nd))
+            # simplified crowding
+            idx_sorted = np.argsort(all_o[nd, 0])
+            dists[idx_sorted[0]] = np.inf
+            dists[idx_sorted[-1]] = np.inf
+            for i in range(1, len(nd)-1):
+                dists[idx_sorted[i]] = all_o[nd[idx_sorted[i+1]], 0] - all_o[nd[idx_sorted[i-1]], 0]
+            
+            keep = np.argsort(dists)[::-1][:self.archive_limit]
+            nd = nd[keep]
+            
+        self.archive = [(all_p[i].copy(), all_o[i].copy()) for i in nd]
+
+    def run_optimization(self, X_train, y_train, X_val, y_val, input_size):
+        rand = np.random.default_rng(42)
+
+        pos = rand.uniform(self.lower_b, self.upper_b, (self.n, 3))
+        den = rand.random((self.n, 3))
+        vol = rand.random((self.n, 3))
+        acc = rand.uniform(self.lower_b, self.upper_b, (self.n, 3))
+
+        objs = np.array([self.fitness_func(pos[i], X_train, y_train, X_val, y_val, input_size) for i in range(self.n)])
+        self.update_archive(pos, objs)
+
+        # start loop
         for t in range(1, self.T + 1):
-            TF = np.exp((t - self.T) / self.T)
-            d  = max(np.exp((self.T - t) / self.T) - (t / self.T), 1e-8)
+            tf = np.exp((t - self.T) / self.T)
+            d = max(np.exp((self.T - t) / self.T) - (t / self.T), 1e-8)
 
-            den = den + rng.random((self.n, 3)) * (den[best_idx] - den)
-            vol = vol + rng.random((self.n, 3)) * (vol[best_idx] - vol)
+            best_idx = np.argmin(objs[:, 0])
+            x_best = pos[best_idx].copy()
 
-            if TF <= 0.5:
-                mr  = rng.integers(0, self.n, self.n)
-                acc = (den[mr] * vol[mr] * acc[mr]) / (den * vol + 1e-8)
+            den = den + rand.random((self.n, 3)) * (den[best_idx] - den)
+            vol = vol + rand.random((self.n, 3)) * (vol[best_idx] - vol)
+
+            if tf <= 0.5:
+                r_idx = rand.integers(0, self.n, self.n)
+                acc = (den[r_idx] * vol[r_idx] * acc[r_idx]) / (den * vol + 1e-8)
             else:
                 acc = (den[best_idx] * vol[best_idx] * acc[best_idx]) / (den * vol + 1e-8)
 
-            a_min, a_max = acc.min(), acc.max()
-            acc_norm = (0.1 + 0.8 * (acc - a_min) / (a_max - a_min + 1e-8))
+            a_low, a_high = acc.min(), acc.max()
+            acc_norm = 0.1 + 0.8 * (acc - a_low) / (a_high - a_low + 1e-8)
 
-            if TF <= 0.5:
-                x_rand = rng.uniform(self.lb, self.ub, (self.n, 3))
-                pos = pos + 2 * rng.random((self.n, 3)) * acc_norm * d * (x_rand - pos)
+            if tf <= 0.5:
+                x_rand = rand.uniform(self.lower_b, self.upper_b, (self.n, 3))
+                pos = pos + 2 * rand.random((self.n, 3)) * acc_norm * d * (x_rand - pos)
             else:
-                F   = np.where(rng.random((self.n, 3)) > 0.5, 1, -1)
-                pos = x_best + F * 6 * rng.random((self.n, 3)) * acc_norm * d * (x_best - pos)
+                F = np.where(rand.random((self.n, 3)) > 0.5, 1, -1)
+                # pick a random one from archive as leader
+                lead = self.archive[rand.choice(len(self.archive))][0]
+                pos = lead + F * 6 * rand.random((self.n, 3)) * acc_norm * d * (lead - pos)
 
-            pos = np.clip(pos, self.lb, self.ub)
+            pos = np.clip(pos, self.lower_b, self.upper_b)
+            objs = np.array([self.fitness_func(pos[i], X_train, y_train, X_val, y_val, input_size) for i in range(self.n)])
+            self.update_archive(pos, objs)
 
-            fitness = np.array([self._fitness(pos[i], X_train, y_train,
-                                              X_val, y_val, input_size)
-                                for i in range(self.n)])
+            tmp_best = min(self.archive, key=lambda x: x[1][0])
+            print(f"Iter {t}/{self.T} | Best Acc: {(1-tmp_best[1][0])*100:.2f}%")
 
-            new_best = np.argmax(fitness)
-            if fitness[new_best] > fitness[best_idx]:
-                best_idx = new_best
-                x_best   = pos[new_best].copy()
-
-            print(f"  AOA Iter {t:02d}/{self.T} | best acc: {fitness[best_idx]:.4f} | "
-                  f"params: {self._decode(x_best)}")
-
-        return self._decode(x_best)
+        final_sol = min(self.archive, key=lambda x: x[1][0])
+        return self.get_params(final_sol[0])
 
 
-# ---------------------------------------------------------
-# Evaluation metrics
-# ---------------------------------------------------------
-def evaluate(y_true, y_pred):
-    acc     = accuracy_score(y_true, y_pred)
-    f1      = f1_score(y_true, y_pred, average="weighted")
-    mcc     = matthews_corrcoef(y_true, y_pred)
-    kappa   = cohen_kappa_score(y_true, y_pred)
-    cm      = confusion_matrix(y_true, y_pred)
+def do_evaluation(y_true, y_pred):
+    acc = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average="weighted")
+    mcc = matthews_corrcoef(y_true, y_pred)
+    kap = cohen_kappa_score(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
 
     tn, fp, fn, tp = cm.ravel()
-    sensitivity = tp / (tp + fn + 1e-8)
-    specificity = tn / (tn + fp + 1e-8)
+    sens = tp / (tp + fn + 1e-8)
+    spec = tn / (tn + fp + 1e-8)
 
-    print("\n--- Results ---")
-    print(f"  Accuracy   : {acc*100:.2f}%")
-    print(f"  Sensitivity: {sensitivity*100:.2f}%")
-    print(f"  Specificity: {specificity*100:.2f}%")
-    print(f"  F-Score    : {f1*100:.2f}%")
-    print(f"  MCC        : {mcc:.4f}")
-    print(f"  Kappa      : {kappa:.4f}")
-    print("\nConfusion Matrix:")
-    print(cm)
-    print("\nClassification Report:")
-    print(classification_report(y_true, y_pred, target_names=["Tumor", "Normal"]))
-
-    return acc, sensitivity, specificity, f1, mcc, kappa
+    print("\n--- RESULTS ---")
+    print(f"Accuracy: {acc*100:.2f}%")
+    print(f"Sens: {sens*100:.2f}% | Spec: {spec*100:.2f}%")
+    print(f"F1: {f1*100:.2f}% | MCC: {mcc:.4f} | Kappa: {kap:.4f}")
+    return acc, sens, spec, f1, mcc, kap
 
 
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
+# MAIN SCRIPT
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
 
 if __name__ == "__main__":
+    # path stuff
+    path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    features = np.load(os.path.join(path, "data/features/features.npy"))
+    labels = np.load(os.path.join(path, "data/features/labels.npy"))
 
-    # Load features
-    X = np.load("data/features/features.npy")
-    y = np.load("data/features/labels.npy")
+    import sklearn.preprocessing
+    sc = sklearn.preprocessing.StandardScaler()
+    X_scaled = sc.fit_transform(features)
 
-    # Normalize
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, labels, test_size=0.3, random_state=42, stratify=labels)
+    X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.15, random_state=42, stratify=y_train)
 
-    # Train/test split (70/30 as per paper)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.30, random_state=42, stratify=y)
+    # prepare tensors
+    in_dim = X_train.shape[1] // n_steps
+    
+    def prep_data(X, y):
+        xt = torch.tensor(X[:, :n_steps * in_dim], dtype=torch.float32).reshape(-1, n_steps, in_dim).to(device)
+        yt = torch.tensor(y, dtype=torch.long).to(device)
+        return xt, yt
 
-    print(f"Train: {X_train.shape} | Test: {X_test.shape}")
+    xtr, ytr = prep_data(X_tr, y_tr)
+    xval, yval = prep_data(X_val, y_val)
+    xtest, ytest = prep_data(X_test, y_test)
 
-    # Validation split from train (for AOA fitness)
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_train, y_train, test_size=0.15, random_state=42, stratify=y_train)
+    # optimize
+    print("\nStarting optimization...")
+    opt_lr, opt_bs, opt_eps = MOAOA_Optimizer(15, 30).run_optimization(xtr, ytr, xval, yval, in_dim)
+    print(f"Best: lr={opt_lr}, bs={opt_bs}, eps={opt_eps}")
 
-    # Convert to tensors
-    # LSTM expects (batch, seq_len, input_size) -> seq_len=1 here
-    def to_tensor(X, y):
-        return (torch.tensor(X, dtype=torch.float32).unsqueeze(1).to(device),
-                torch.tensor(y, dtype=torch.long).to(device))
+    # train final model
+    m = MyLSTM(in_dim).to(device)
+    optimizer = torch.optim.Adam(m.parameters(), lr=opt_lr)
+    loss_fn = nn.CrossEntropyLoss()
 
-    X_tr_t,  y_tr_t  = to_tensor(X_tr,   y_tr)
-    X_val_t, y_val_t = to_tensor(X_val,  y_val)
-    X_test_t,y_test_t= to_tensor(X_test, y_test)
-
-    input_size = X_train.shape[1]  # 1186
-
-    # AOA hyperparameter optimization
-    print("\nRunning AOA for hyperparameter optimization...")
-    best_lr, best_batch, best_hidden = AOA_LSTM(
-        n_particles=10, max_iter=20
-    ).optimise(X_tr_t, y_tr_t, X_val_t, y_val_t, input_size)
-
-    print(f"\nBest params -> lr: {best_lr} | batch: {best_batch} | hidden: {best_hidden}")
-
-    # Final training with best params
-    print("\nFinal training with best hyperparameters...")
-    model = LSTMClassifier(input_size=input_size,
-                           hidden_size=best_hidden).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
-    criterion = nn.CrossEntropyLoss()
-
-    dataset = TensorDataset(X_tr_t, y_tr_t)
-    loader  = DataLoader(dataset, batch_size=best_batch, shuffle=True)
-
-    # Full training - 100 epochs
-    for epoch in range(1, 101):
-        model.train()
-        total_loss = 0
+    loader = DataLoader(TensorDataset(xtr, ytr), batch_size=opt_bs, shuffle=True)
+    for e in range(1, opt_eps + 1):
+        m.train()
+        L = 0
         for xb, yb in loader:
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
-            loss.backward()
+            l = loss_fn(m(xb), yb)
+            l.backward()
             optimizer.step()
-            total_loss += loss.item()
+            L += l.item()
+        if e % 50 == 0 or e == opt_eps:
+            print(f"Epoch {e}/{opt_eps} - loss: {L/len(loader):.4f}")
 
-        if epoch % 10 == 0:
-            print(f"  Epoch {epoch:03d}/100 | Loss: {total_loss:.4f}")
-
-    # Evaluation
-    model.eval()
+    # final eval
+    m.eval()
     with torch.no_grad():
-        preds = torch.argmax(model(X_test_t), dim=1).cpu().numpy()
+        preds = torch.argmax(m(xtest), dim=1).cpu().numpy()
+    do_evaluation(y_test, preds)
 
-    evaluate(y_test, preds)
-
-    # Save model
-    torch.save(model.state_dict(), "data/features/lstm_model.pth")
-    print("\nModel saved to data/features/lstm_model.pth")
+    torch.save(m.state_dict(), "data/features/lstm_model.pth")
+    print("Done.")

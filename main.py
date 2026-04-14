@@ -1,9 +1,15 @@
 import numpy as np
+import os
 
-features = np.load("data/features/features.npy")
-labels   = np.load("data/features/labels.npy")
-indices  = np.load("data/features/indices.npy")
+print("--- LOADER SCRIPT ---")
 
-print("Features shape:", features.shape)
-print("Labels shape  :", labels.shape)
-print("Unique labels :", np.unique(labels, return_counts=True))
+# load the features we saved
+f = np.load("data/features/features.npy")
+l = np.load("data/features/labels.npy")
+idx = np.load("data/features/indices.npy")
+
+print("Features shape: ", f.shape)
+print("Labels shape  : ", l.shape)
+print("Unique labels : ", np.unique(l, return_counts=True))
+
+print("Ready for training.")
