@@ -7,12 +7,12 @@ import torchvision.transforms as transforms
 from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
 import timm
 
-# GPU or CPU
+#use gpu if available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Extract features from mobilenet
 class MobFeats(nn.Module):
-    # Layers for maxpool: 3, 13, 16, 17, 18
+    # Layers: 3, 13, 16, 17, 18
     layers_to_pool = {3, 13, 16, 17, 18}
 
     def __init__(self):
@@ -59,7 +59,7 @@ class EffFeats(nn.Module):
         res.append(self.pool(x).flatten(1))
         return torch.cat(res, dim=1)
 
-
+#get the toatl features
 def get_models():
     m1 = MobFeats().to(device).eval()
     m2 = EffFeats().to(device).eval()
@@ -76,7 +76,7 @@ def get_models():
     return m1, m2
 
 
-# standard transforms
+# tranformations
 img_transform = transforms.Compose([
     transforms.ToPILImage(),
     transforms.Resize((224, 224)),
@@ -158,4 +158,3 @@ if __name__ == "__main__":
         classes = ("yes", "no"),
         n = 1186
     )
- )

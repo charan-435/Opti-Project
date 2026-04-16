@@ -7,9 +7,10 @@ from sklearn.metrics import (accuracy_score, confusion_matrix,
                              classification_report)
 import torch
 import torch.nn as nn
+
+
 from torch.utils.data import DataLoader, TensorDataset
 
-# --- settings ---
 n_steps = 2
 h_size = 128
 
@@ -25,7 +26,7 @@ class MyLSTM(nn.Module):
         self.fc = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x):
-        # x: (batch, n_steps, input_size)
+       
         out, _ = self.lstm(x)
         out = out[:, -1, :] 
         return self.fc(out)
