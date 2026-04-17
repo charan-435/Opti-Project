@@ -1,178 +1,189 @@
 import cv2
 import numpy as np
+import os
 
-# ---------------------------------------------------------
-# Shannon entropy
-# ---------------------------------------------------------
-def shannon_entropy(prob):
-    prob = prob[prob > 0]
-    return -np.sum(prob * np.log2(prob))
+# shannon entropy logic
+def calc_entropy(p):
+    p = p[p > 0]                       #P vector --> Fraction of each gray scale intensity 
+    return -np.sum(p * np.log2(p))
 
-
-def multi_threshold_entropy(hist_norm, thresholds):
-    """
-    Compute entropy for multiple thresholds
-    thresholds = sorted list like [t1, t2, t3]
-    """
-    thresholds = sorted([int(t) for t in thresholds])
-    regions = []
+#<=======================================================>
+def get_multi_entropy(h_norm, t_list):
+    t_list = sorted([int(t) for t in t_list])
+    regs = []       #Contains the 4 vectors for each region 
     
-    prev = 0
-    for t in thresholds:
-        regions.append(hist_norm[prev:t])
-        prev = t
-    regions.append(hist_norm[prev:])  # last region
+    last = 0
+    for t in t_list:               #filling regions(regs)
+        regs.append(h_norm[last:t])
+        last = t
+    regs.append(h_norm[last:])
 
-    total_entropy = 0
+    ent = 0                #calculating entropy for the given t_list
+    for r in regs:
+        p_sum = r.sum()
+        if p_sum > 0:
+            ent += calc_entropy(r / p_sum)
+    return ent
+#returns total entropy for the given threshold vector
+#<=======================================================>
 
-    for region in regions:
-        p = region.sum()
-        if p > 0:
-            total_entropy += shannon_entropy(region / p)
-
-    return total_entropy
 
 
-# ---------------------------------------------------------
-# MULTI-THRESHOLD AOA
-# ---------------------------------------------------------
-class AOA_Multi:
-    def __init__(self, n_particles=20, max_iter=50, n_thresholds=3):
-        self.n = n_particles
-        self.T = max_iter
-        self.k = n_thresholds
-        self.lb = 1
-        self.ub = 254
-
-    def _fitness(self, positions, hist_norm):
-        fitness = []
-        for pos in positions:
-            thresholds = np.clip(pos, self.lb, self.ub)
-            fitness.append(multi_threshold_entropy(hist_norm, thresholds))
-        return np.array(fitness)
-
-    def optimise(self, img):
+class ThresholdFinder:
+    
+    
+    def __init__(self, n=20, iters=50, k=3):
+        self.n = n
+        self.T = iters
+        self.k = k
+        self.min_v = 1
+        self.max_v = 254
+   # n =20 ----> rnadom objects
+   # iters = 50 -----> iterations
+   # k = 3 -----> 4 regions
+#<=======================================================>
+    def fitness(self, positions, h_norm):
+        f = []
+        for p in positions:
+            t = np.clip(p, self.min_v, self.max_v)
+            f.append(get_multi_entropy(h_norm, t))
+        return np.array(f)
+#returns the fitness for each object 
+#<=======================================================>
+    def find(self, img):
         if img.dtype != np.uint8:
             img = (img * 255).astype(np.uint8)
+          #image type changing
+        
+        h = cv2.calcHist([img], [0], None, [256], [0, 256]).flatten()
+        hn = h / h.sum()
+         #NORMALISED HISTOGRAM
+#<=======================================================>        
+        r = np.random.default_rng()
 
-        hist = cv2.calcHist([img], [0], None, [256], [0, 256]).flatten()
-        hist_norm = hist / hist.sum()
+        # init
+        p = r.uniform(self.min_v, self.max_v, (self.n, self.k))
+        #position matrix , 20*3 dimensions 
+        
+        d = r.random((self.n, self.k))
+        #density for each object 
+        v = r.random((self.n, self.k))
+        #velocity for each object 
+        a = r.uniform(self.min_v, self.max_v, (self.n, self.k))
+        #acceleration for each object 
+#<=======================================================>        
+        fit = self.fitness(p, hn)
+        #calculate initial fitness for each object , 20 size vector 
+        best_i = np.argmax(fit)
+        #best value (argument/which position has best entropy)
+        x_best = p[best_i].copy()
+#<=======================================================>
 
-        rng = np.random.default_rng()
-
-        # Initialize particles (each particle = vector of thresholds)
-        pos = rng.uniform(self.lb, self.ub, (self.n, self.k))
-        den = rng.random((self.n, self.k))
-        vol = rng.random((self.n, self.k))
-        acc = rng.uniform(self.lb, self.ub, (self.n, self.k))
-
-        fitness = self._fitness(pos, hist_norm)
-        best_idx = np.argmax(fitness)
-        x_best = pos[best_idx].copy()
-
+       
+        #20 iterations 
         for t in range(1, self.T + 1):
-            TF = np.exp((t - self.T) / self.T)
-            d = max(np.exp((self.T - t) / self.T) - (t / self.T), 1e-8)
+            
+            tf = np.exp((t - self.T) / self.T)
+            #transfer function based on current iteration 
+            #tells when to do exploration vs exploitation 
+            #gradual increase due to exponential nature 
+            
+            
+            
+            #MOVEMENT SCALING FACTOR
+            
+            dist_val = max(np.exp((self.T - t) / self.T) - (t / self.T), 1e-8)
+            #A VALUE TO DECIDE SCALING OF MOVEMENT ---> early iterations == fast movement
+            # ELSE ----->late iterations == slow_movement
 
-            # Update density & volume
-            den = den + rng.random((self.n, self.k)) * (den[best_idx] - den)
-            vol = vol + rng.random((self.n, self.k)) * (vol[best_idx] - vol)
+            #update densities and velocities towards best 
+            d = d + r.random((self.n, self.k)) * (d[best_i] - d)
+            v = v + r.random((self.n, self.k)) * (v[best_i] - v)
 
-            # Acceleration update
-            if TF <= 0.5:
-                mr = rng.integers(0, self.n, self.n)
-                acc = (den[mr] * vol[mr] * acc[mr]) / (den * vol)
+            if tf <= 0.5:
+                # exploration
+                m_idx = r.integers(0, self.n, self.n)  #RANDOM OBJECT SELECTED TO  MOVE OTHER OBJECTS
+                a = (d[m_idx] * v[m_idx] * a[m_idx]) / (d * v + 1e-8)
             else:
-                acc = (den[best_idx] * vol[best_idx] * acc[best_idx]) / (den * vol)
+                # exploitation
+                a = (d[best_i] * v[best_i] * a[best_i]) / (d * v + 1e-8)   #BEST OBJECT SELECTED TO MOVE OTHER OBJECTS
 
-            # Normalize acceleration
-            a_min, a_max = acc.min(), acc.max()
-            acc_norm = (0.1 + 0.8 * (acc - a_min) / (a_max - a_min)
-                        if a_max > a_min else np.full_like(acc, 0.5))
-
-            # Position update
-            if TF <= 0.5:
-                x_rand = rng.uniform(self.lb, self.ub, (self.n, self.k))
-                pos = pos + 2 * rng.random((self.n, self.k)) * acc_norm * d * (x_rand - pos)
+            a_min, a_max = a.min(), a.max()
+            an = (0.1 + 0.8 * (a - a_min) / (a_max - a_min) if a_max > a_min else np.full_like(a, 0.5))
+            #1)NORMALIZING ACC
+            #2)SCALING ACC FROM 0.1 to 0.9 {avoids extreme movements}
+            #3)EDGE CASE --- > IF AMAX == AMIN (MAKE EVERYTHING NEUTRAL VALUE = 0.5) 
+            
+            
+            if tf <= 0.5:  
+                xr = r.uniform(self.min_v, self.max_v, (self.n, self.k)) #RANDOM POSITION FOR EACH OBJECT 
+                p = p + 2 * r.random((self.n, self.k)) * an * dist_val * (xr - p)
+                #MOVE TO THE CORRESPONDING RANDOM OBJECT WITH SOME MORE RANDOM PARAMETERS FOR EACH DIMENSION
             else:
-                F = np.where(rng.random((self.n, self.k)) > 0.5, 1, -1)
-                pos = x_best + F * 6 * rng.random((self.n, self.k)) * acc_norm * d * (x_best - pos)
+                F = np.where(r.random((self.n, self.k)) > 0.5, 1, -1) #EACH VALUE EITHER +1 or -1
+                #ENSURES MOVEMENT AROUND BOTH DIRECTION OF THE BEST SOLUTION AND NOT JUST ONE DIRECTION
+                p = x_best + F * 6 * r.random((self.n, self.k)) * an * dist_val * (x_best - p)
+              
+            p = np.clip(p, self.min_v, self.max_v)  #filter P for the grayscale values 0->254
+            fit = self.fitness(p, hn)  #new fitness 
+            new_b = np.argmax(fit)     #new best object 
 
-            pos = np.clip(pos, self.lb, self.ub)
-
-            # Evaluate
-            fitness = self._fitness(pos, hist_norm)
-            new_best = np.argmax(fitness)
-
-            if fitness[new_best] > fitness[best_idx]:
-                best_idx = new_best
-                x_best = pos[new_best].copy()
-
-        return sorted([int(round(t)) for t in x_best])
+            if fit[new_b] > fit[best_i]:
+                best_i = new_b
+                x_best = p[new_b].copy()
+             #if new best better keep it as best 
+        return sorted([int(round(val)) for val in x_best])
+        #finally return the best threshold
 
 
-# ---------------------------------------------------------
-# SEGMENT USING MULTIPLE THRESHOLDS
-# ---------------------------------------------------------
-def segment_multi(img, n_thresholds=3):
+def do_segment(img, k=3):
     if len(img.shape) == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    thresholds = AOA_Multi(n_thresholds=n_thresholds).optimise(img)
-
-    levels = [0] + thresholds + [256]
+    t_vals = ThresholdFinder(k=k).find(img)
+    lvls = [0] + t_vals + [256]
     
-    # ✅ Explicit intensity values for each region
-    n_regions = len(levels) - 1
-    intensity_values = [int(i * 255 / (n_regions - 1)) for i in range(n_regions)]
-    # → gives exactly [0, 85, 170, 255] for 4 regions
+    n_r = len(lvls) - 1
+    ints = [int(i * 255 / (n_r - 1)) for i in range(n_r)]
     
-    segmented = np.zeros_like(img)
-
-    for i in range(n_regions):
-        lower = levels[i]
-        upper = levels[i + 1]
-
-        if i == n_regions - 1:
-            mask = (img >= lower) & (img <= upper)
+    res = np.zeros_like(img)
+    for i in range(n_r):
+        low, high = lvls[i], lvls[i+1]
+        if i == n_r - 1:
+            m = (img >= low) & (img <= high)
         else:
-            mask = (img >= lower) & (img < upper)
+            m = (img >= low) & (img < high)
+        res[m] = ints[i]
 
-        segmented[mask] = intensity_values[i]
+    return res, t_vals
 
-    return segmented, thresholds
-import os
+def run_dataset_seg(in_dir, out_dir, labels=("yes", "no"), k=3):
+    for l in labels:
+        p_in = os.path.join(in_dir, l)
+        p_out = os.path.join(out_dir, l)
+        if not os.path.exists(p_out): os.makedirs(p_out)
 
-def segment_dataset_multi(input_dir, output_dir, labels=("yes", "no"), n_thresholds=3):
-    for label in labels:
-        in_path = os.path.join(input_dir, label)
-        out_path = os.path.join(output_dir, label)
-        os.makedirs(out_path, exist_ok=True)
+        files = [f for f in os.listdir(p_in) if f.lower().endswith((".jpg", ".png", ".jpeg"))]
+        print(f"Seg processing {l} - {len(files)} files")
 
-        files = [f for f in os.listdir(in_path)
-                 if f.lower().endswith((".jpg", ".png", ".jpeg"))]
+        for i, f in enumerate(files, 1):
+            img = cv2.imread(os.path.join(p_in, f), cv2.IMREAD_GRAYSCALE)
+            if img is None: continue
 
-        print(f"[MULTI] Processing {label} ({len(files)} images)")
+            seg, t = do_segment(img, k)
+            out_f = os.path.splitext(f)[0] + ".png"
+            cv2.imwrite(os.path.join(p_out, out_f), seg)
+            
+            if i % 20 == 0:
+                print(f"{i}/{len(files)} - {t}")
 
-        for i, fname in enumerate(files, 1):
-            img = cv2.imread(os.path.join(in_path, fname), cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
 
-            segmented, thresholds = segment_multi(img, n_thresholds)
-
-            # ✅ Force PNG extension to avoid JPEG compression artifacts
-            out_fname = os.path.splitext(fname)[0] + ".png"
-            cv2.imwrite(os.path.join(out_path, out_fname), segmented)
-
-            print(f"[{i}/{len(files)}] {fname} -> {thresholds}")
-import os
 if __name__ == "__main__":
-    segment_dataset_multi(
-        input_dir="data/augmented",
-        output_dir="data/segmented_multi",
+    base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    run_dataset_seg(
+        in_dir=os.path.join(base, "data/augmented"),
+        out_dir=os.path.join(base, "data/segmented_multi"),
         labels=("yes", "no"),
-        n_thresholds=3
+        k=3
     )
-
-    print("Done ✅")
+    print("finished.")
