@@ -1,7 +1,7 @@
 numpy
 pandas
 matplotlib
-sckit-learn
+scikit-learn
 opencv-python
 tensorflow
 torch
