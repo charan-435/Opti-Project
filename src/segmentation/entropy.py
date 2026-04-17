@@ -141,19 +141,21 @@ def do_segment(img, k=3):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     t_vals = ThresholdFinder(k=k).find(img)
-    lvls = [0] + t_vals + [256]
+    lvls = [0] + t_vals + [256]  #final region vector 
     
     n_r = len(lvls) - 1
     ints = [int(i * 255 / (n_r - 1)) for i in range(n_r)]
+    #assign new and uniform intensties to each region for differentiating 
     
     res = np.zeros_like(img)
-    for i in range(n_r):
+    for i in range(n_r): #for each region 
         low, high = lvls[i], lvls[i+1]
         if i == n_r - 1:
-            m = (img >= low) & (img <= high)
+            m = (img >= low) & (img <= high)   #find the indxs having the intensities in this region 
         else:
             m = (img >= low) & (img < high)
         res[m] = ints[i]
+    #create the result image 
 
     return res, t_vals
 
